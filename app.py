@@ -209,9 +209,14 @@ def on_text(event: MessageEvent):
     with SessionLocal() as db:
         row = db.execute(select(Log).where(Log.user_id == user_id, Log.date == d)).scalar_one_or_none()
         if row:
-            row.status = status
+            if row.status == status:
+                reply = f"本日分は既に「{ '達成' if status=='done' else '未達' }」で記録済みです。"
+            else:
+                row.status = status
+                reply = f"本日分を「{ '達成' if status=='done' else '未達' }」に更新しました。"
         else:
             db.add(Log(user_id=user_id, date=d, status=status))
+            reply = f"本日分を「{ '達成' if status=='done' else '未達' }」で記録しました。"
         db.commit()
 
     with ApiClient(configuration) as api_client:
@@ -219,7 +224,7 @@ def on_text(event: MessageEvent):
         api.reply_message(
             ReplyMessageRequest(
                 replyToken=event.reply_token,
-                messages=[TextMessage(text=f"本日分を「{ '達成' if status=='done' else '未達' }」で記録しました。")]
+                messages=[TextMessage(text=reply)]
             )
         )
 
