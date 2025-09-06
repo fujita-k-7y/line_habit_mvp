@@ -85,16 +85,17 @@ def line_api() -> MessagingApi:
 def today_jst() -> date:
     return datetime.now(JST).date()
 
+WEEK = "月火水木金土日"
+
 def make_checkin_message() -> TextMessage:
     """達成/未達のクイックリプライを付けた本文を作成"""
     qr = QuickReply(items=[
         QuickReplyItem(action=PostbackAction(label="達成", data="status=done")),
         QuickReplyItem(action=PostbackAction(label="未達", data="status=skip")),
     ])
-    return TextMessage(
-        text="本日のチェックイン：達成/未達を選んでください ✅",
-        quickReply=qr
-    )
+    d = datetime.now(JST).date()
+    w = WEEK[d.weekday()]
+    return TextMessage(text=f"{d.isoformat()}（{w}）のチェックイン ✅\n達成/未達を選んでください。", quickReply=qr)
 
 # ============= ルーティング =============
 @app.get("/healthz")
