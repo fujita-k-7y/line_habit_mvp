@@ -1,0 +1,16 @@
+name: Daily Check-in
+
+on:
+  schedule:
+    - cron: "0 23 * * *"   # 23:00 UTC = 08:00 JST
+  workflow_dispatch:        # 手動実行ボタン
+
+jobs:
+  ping:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Call cron endpoint
+        env:
+          CRON_URL: ${{ secrets.CRON_URL }}   # 先にSecretsに入れておく
+        run: |
+          curl -fSs -X POST "$CRON_URL"
