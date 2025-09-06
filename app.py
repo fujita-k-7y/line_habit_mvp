@@ -66,6 +66,24 @@ class Log(Base):
 
 Base.metadata.create_all(bind=engine)
 
+def upsert_daily_log(db: Session, user_id: str, d: date, status: str) -> str:
+    """
+    returns: 'created' | 'updated' | 'same'
+    """
+    row = db.execute(
+        select(Log).where(Log.user_id == user_id, Log.date == d)
+    ).scalar_one_or_none()
+    if row:
+        if row.status == status:
+            return "same"
+        row.status = status
+        db.commit()
+        return "updated"
+    else:
+        db.add(Log(user_id=user_id, date=d, status=status))
+        db.commit()
+        return "created"
+
 def get_db():
     db = SessionLocal()
     try:
@@ -155,7 +173,6 @@ def on_follow(event: FollowEvent):
 
 @handler.add(PostbackEvent)
 def on_postback(event: PostbackEvent):
-    """クイックリプライやボタンからの応答を受けて保存"""
     user_id = event.source.user_id
     data = event.postback.data or ""
     status = "done" if "status=done" in data else ("skip" if "status=skip" in data else None)
@@ -164,29 +181,31 @@ def on_postback(event: PostbackEvent):
 
     d = today_jst()
     with SessionLocal() as db:
-        # 既存があれば上書き
-        row = db.execute(
-            select(Log).where(Log.user_id == user_id, Log.date == d)
-        ).scalar_one_or_none()
-        if row:
-            row.status = status
-        else:
-            db.add(Log(user_id=user_id, date=d, status=status))
-        db.commit()
+        # 未登録なら保険で登録
+        if not db.get(User, user_id):
+            db.add(User(user_id=user_id))
+            db.commit()
 
-    # 返信（replyToken経由）
+        result = upsert_daily_log(db, user_id, d, status)
+
+    if result == "same":
+        reply_text = f"本日分は既に「{'達成' if status=='done' else '未達'}」で記録済みです。"
+    elif result == "updated":
+        reply_text = f"本日分を「{'達成' if status=='done' else '未達'}」に更新しました。"
+    else:  # created
+        reply_text = f"本日分を「{'達成' if status=='done' else '未達'}」で記録しました。"
+
     with ApiClient(configuration) as api_client:
         api = MessagingApi(api_client)
         api.reply_message(
             ReplyMessageRequest(
                 replyToken=event.reply_token,
-                messages=[TextMessage(text=f"本日分を「{ '達成' if status=='done' else '未達' }」で記録しました。")]
+                messages=[TextMessage(text=reply_text)]
             )
         )
 
 @handler.add(MessageEvent, message=TextMessageContent)
 def on_text(event: MessageEvent):
-    """テキストで「達成/未達」と送られた場合のフォールバック"""
     user_id = event.source.user_id
     text = (event.message.text or "").strip().lower()
     if text in ("done", "達成", "y", "yes"):
@@ -194,7 +213,6 @@ def on_text(event: MessageEvent):
     elif text in ("skip", "未達", "n", "no"):
         status = "skip"
     else:
-        # ガイドメッセージ
         with ApiClient(configuration) as api_client:
             api = MessagingApi(api_client)
             api.reply_message(
@@ -207,24 +225,24 @@ def on_text(event: MessageEvent):
 
     d = today_jst()
     with SessionLocal() as db:
-        row = db.execute(select(Log).where(Log.user_id == user_id, Log.date == d)).scalar_one_or_none()
-        if row:
-            if row.status == status:
-                reply = f"本日分は既に「{ '達成' if status=='done' else '未達' }」で記録済みです。"
-            else:
-                row.status = status
-                reply = f"本日分を「{ '達成' if status=='done' else '未達' }」に更新しました。"
-        else:
-            db.add(Log(user_id=user_id, date=d, status=status))
-            reply = f"本日分を「{ '達成' if status=='done' else '未達' }」で記録しました。"
-        db.commit()
+        if not db.get(User, user_id):
+            db.add(User(user_id=user_id))
+            db.commit()
+        result = upsert_daily_log(db, user_id, d, status)
+
+    if result == "same":
+        reply_text = f"本日分は既に「{'達成' if status=='done' else '未達'}」で記録済みです。"
+    elif result == "updated":
+        reply_text = f"本日分を「{'達成' if status=='done' else '未達'}」に更新しました。"
+    else:
+        reply_text = f"本日分を「{'達成' if status=='done' else '未達'}」で記録しました。"
 
     with ApiClient(configuration) as api_client:
         api = MessagingApi(api_client)
         api.reply_message(
             ReplyMessageRequest(
                 replyToken=event.reply_token,
-                messages=[TextMessage(text=reply)]
+                messages=[TextMessage(text=reply_text)]
             )
         )
 
