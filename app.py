@@ -5,7 +5,7 @@ from datetime import datetime, date
 from zoneinfo import ZoneInfo
 
 from fastapi import FastAPI, Request, HTTPException, Depends, Query
-from fastapi.responses import JSONResponse, StreamingResponse, PlainTextResponse
+from fastapi.responses import JSONResponse, StreamingResponse, PlainTextResponse, RedirectResponse
 from pydantic import BaseModel
 from dotenv import load_dotenv
 
@@ -100,6 +100,10 @@ def make_checkin_message() -> TextMessage:
 @app.get("/healthz")
 def healthz():
     return {"ok": True, "now": datetime.now(JST).isoformat()}
+
+@app.get("/")
+def root():
+    return RedirectResponse(url="/docs")
 
 # --- Webhook（LINE -> 当アプリ） ---
 @app.post("/webhook")
