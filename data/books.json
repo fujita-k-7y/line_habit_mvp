@@ -1,0 +1,14 @@
+{
+  "books": [
+    {"id": "b1", "title": "話し方が9割"},
+    {"id": "b2", "title": "成功の法則"},
+    {"id": "b3", "title": "営業成績1位を取る方法"},
+    {"id": "b4", "title": "ひとりで起業"}
+  ],
+  "behaviors": [
+    {"id": "h1", "book_id": "b2", "title": "仕事や作業は朝やる", "kind": "action"},
+    {"id": "h2", "book_id": "b2", "title": "1日1つだけを欠かさずやる", "kind": "action"},
+    {"id": "h3", "book_id": "b2", "title": "部屋をきれいに保つ", "kind": "action"},
+    {"id": "h4", "book_id": "b2", "title": "店員さんにも挨拶をする", "kind": "mind"}
+  ]
+}

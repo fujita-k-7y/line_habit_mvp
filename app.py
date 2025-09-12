@@ -23,6 +23,11 @@ from linebot.v3.messaging.models import (
     QuickReply, QuickReplyItem, PostbackAction
 )
 
+# テーブルモデルおよびSeed API
+import json
+from pathlib import Path
+from sqlalchemy import Boolean, CheckConstraint
+
 # ============= 基本設定 =============
 load_dotenv()
 JST = ZoneInfo(os.getenv("TZ", "Asia/Tokyo"))
@@ -63,6 +68,52 @@ class Log(Base):
     user: Mapped[User] = relationship("User", back_populates="logs")
 
     __table_args__ = (UniqueConstraint("user_id", "date", name="uq_user_date"),)
+
+class Book(Base):
+    __tablename__ = "books"
+    id: Mapped[str] = mapped_column(String, primary_key=True)
+    title: Mapped[str] = mapped_column(String, nullable=False)
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=lambda: datetime.now(JST))
+    behaviors: Mapped[list["Behavior"]] = relationship("Behavior", back_populates="book", cascade="all, delete-orphan")
+
+class Behavior(Base):
+    __tablename__ = "behaviors"
+    id: Mapped[str] = mapped_column(String, primary_key=True)
+    book_id: Mapped[str] = mapped_column(String, ForeignKey("books.id"), index=True)
+    title: Mapped[str] = mapped_column(String, nullable=False)
+    kind: Mapped[str] = mapped_column(String, nullable=False)  # 'action' or 'mind'
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=lambda: datetime.now(JST))
+    book: Mapped[Book] = relationship("Book", back_populates="behaviors")
+
+class UserBehavior(Base):
+    __tablename__ = "user_behaviors"
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    user_id: Mapped[str] = mapped_column(String, index=True)
+    behavior_id: Mapped[str] = mapped_column(String, ForeignKey("behaviors.id"), index=True)
+    # schedule
+    schedule_type: Mapped[str] = mapped_column(String, default="daily")  # 'daily'|'weekly'|'once'
+    days_mask: Mapped[int] = mapped_column(Integer, default=127)         # 7bit: 月(1)<<0 .. 日(1)<<6, 127=毎日
+    hour: Mapped[int] = mapped_column(Integer, default=21)               # 9 or 21（MVP）
+    run_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)  # once用
+    enabled: Mapped[bool] = mapped_column(Boolean, default=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=lambda: datetime.now(JST))
+    __table_args__ = (
+        UniqueConstraint("user_id", "behavior_id", name="uq_user_behavior"),
+        CheckConstraint("schedule_type in ('daily','weekly','once')", name="ck_schedule_type"),
+    )
+
+class Checkin(Base):
+    __tablename__ = "checkins"
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    user_id: Mapped[str] = mapped_column(String, index=True)
+    behavior_id: Mapped[str] = mapped_column(String, ForeignKey("behaviors.id"), index=True)
+    date: Mapped[date] = mapped_column(Date, index=True)
+    result: Mapped[str] = mapped_column(String)  # 'did'|'didnt'|'pass'
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=lambda: datetime.now(JST))
+    __table_args__ = (
+        UniqueConstraint("user_id", "behavior_id", "date", name="uq_checkin"),
+        CheckConstraint("result in ('did','didnt','pass')", name="ck_result"),
+    )
 
 Base.metadata.create_all(bind=engine)
 
@@ -308,3 +359,51 @@ def admin_export(key: str = Query(...), db: Session = Depends(get_db)):
 
     headers = {"Content-Disposition": 'attachment; filename="logs.csv"'}
     return StreamingResponse(iter([buf.read()]), media_type="text/csv", headers=headers)
+
+# --- 管理用：Seed投入API ---
+@app.post("/admin/seed")
+def admin_seed(key: str = Query(...), db: Session = Depends(get_db)):
+    if key != ADMIN_KEY:
+        raise HTTPException(status_code=403, detail="forbidden")
+
+    data_path = Path(__file__).parent / "data" / "books.json"
+    if not data_path.exists():
+        raise HTTPException(status_code=400, detail=f"seed file not found: {data_path}")
+
+    payload = json.loads(data_path.read_text(encoding="utf-8"))
+    books = payload.get("books", [])
+    behaviors = payload.get("behaviors", [])
+
+    # upsert: 既存→更新、未登録→追加
+    b_up, h_up = 0, 0
+
+    # Books
+    for b in books:
+        obj = db.get(Book, b["id"])
+        if obj:
+            if obj.title != b["title"]:
+                obj.title = b["title"]
+                b_up += 1
+        else:
+            db.add(Book(id=b["id"], title=b["title"]))
+            b_up += 1
+
+    # Behaviors
+    for h in behaviors:
+        obj = db.get(Behavior, h["id"])
+        if obj:
+            changed = False
+            if obj.title != h["title"]:
+                obj.title = h["title"]; changed = True
+            if obj.book_id != h["book_id"]:
+                obj.book_id = h["book_id"]; changed = True
+            if obj.kind != h["kind"]:
+                obj.kind = h["kind"]; changed = True
+            if changed:
+                h_up += 1
+        else:
+            db.add(Behavior(id=h["id"], book_id=h["book_id"], title=h["title"], kind=h["kind"]))
+            h_up += 1
+
+    db.commit()
+    return {"books_upserted": b_up, "behaviors_upserted": h_up}
