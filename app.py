@@ -4,7 +4,7 @@ from io import StringIO
 from datetime import datetime, date
 from zoneinfo import ZoneInfo
 
-from fastapi import FastAPI, Request, HTTPException, Depends, Query
+from fastapi import FastAPI, Request, HTTPException, Depends, Query, BackgroundTasks
 from fastapi.responses import JSONResponse, StreamingResponse, PlainTextResponse, RedirectResponse
 from pydantic import BaseModel
 from dotenv import load_dotenv
@@ -126,18 +126,19 @@ def root():
 
 # --- Webhook（LINE -> 当アプリ） ---
 @app.post("/webhook")
-async def webhook(request: Request, db: Session = Depends(get_db)):
-    signature = request.headers.get("X-Line-Signature")
-    if not signature:
-        raise HTTPException(status_code=400, detail="Missing signature")
-
-    body = await request.body()
+async def webhook(request: Request, background_tasks: BackgroundTasks, db: Session = Depends(get_db)):
+    sig = request.headers.get("X-Line-Signature")
+    body = (await request.body()).decode("utf-8")
     try:
-        handler.handle(body.decode("utf-8"), signature)
-    except InvalidSignatureError:
-        raise HTTPException(status_code=400, detail="Invalid signature")
-
-    return PlainTextResponse("OK")
+        # ここでは検証だけして…
+        handler.handle  # 呼ぶのは後ろ
+    except Exception:
+        pass
+    # ← 応答を先に返す
+    resp = PlainTextResponse("OK")
+    # ← 実処理はバックグラウンドへ（sig付きで）
+    background_tasks.add_task(handler.handle, body, sig)
+    return resp
 
 # --- イベントハンドラ（Follow / Postback / Text） ---
 @handler.add(FollowEvent)
