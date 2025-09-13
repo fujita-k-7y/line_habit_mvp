@@ -3,6 +3,7 @@ import csv
 from io import StringIO
 from datetime import datetime, date
 from zoneinfo import ZoneInfo
+import urllib.parse as urlparse
 
 from fastapi import FastAPI, Request, HTTPException, Depends, Query, BackgroundTasks
 from fastapi.responses import JSONResponse, StreamingResponse, PlainTextResponse, RedirectResponse
@@ -222,44 +223,84 @@ def on_follow(event: FollowEvent):
                     ]
                 )
             )
+    with SessionLocal() as db:
+        send_books_quickreply(user_id, db)
 
 @handler.add(PostbackEvent)
 def on_postback(event: PostbackEvent):
     user_id = event.source.user_id
     data = event.postback.data or ""
-    status = "done" if "status=done" in data else ("skip" if "status=skip" in data else None)
-    if not status:
+    # 既存の達成/未達（配信チェックイン）
+    if "status=done" in data or "status=skip" in data:
+        status = "done" if "status=done" in data else "skip"
+        d = today_jst()
+        with SessionLocal() as db:
+            # 未登録保険
+            if not db.get(User, user_id):
+                db.add(User(user_id=user_id)); db.commit()
+            result = upsert_daily_log(db, user_id, d, status)
+        reply_text = "本日分を「達成」で記録しました。" if status=="done" else "本日分を「未達」で記録しました。"
+        if result == "same":
+            reply_text = reply_text.replace("で記録しました。", "は既に同じ内容で記録済みです。")
+        elif result == "updated":
+            reply_text = reply_text.replace("で記録しました。", "に更新しました。")
+        with ApiClient(configuration) as api_client:
+            MessagingApi(api_client).reply_message(
+                ReplyMessageRequest(replyToken=event.reply_token, messages=[TextMessage(text=reply_text)])
+            )
         return
 
-    d = today_jst()
-    with SessionLocal() as db:
-        # 未登録なら保険で登録
-        if not db.get(User, user_id):
-            db.add(User(user_id=user_id))
+    # 新フロー：本選択・行動トグル
+    params = parse_postback(data)
+    op = params.get("op")
+    if op == "pick_book":
+        book_id = params.get("book")
+        page = int(params.get("p", "0"))
+        with SessionLocal() as db:
+            if not db.get(User, user_id):
+                db.add(User(user_id=user_id)); db.commit()
+            send_behaviors_page(user_id, book_id, page, db)
+        return
+    if op == "toggle":
+        book_id = params.get("book"); hid = params.get("hid"); page = int(params.get("p","0"))
+        with SessionLocal() as db:
+            if not db.get(User, user_id):
+                db.add(User(user_id=user_id)); db.commit()
+            ub = db.execute(select(UserBehavior).where(UserBehavior.user_id==user_id, UserBehavior.behavior_id==hid)).scalar_one_or_none()
+            if ub:
+                ub.enabled = not ub.enabled
+            else:
+                db.add(UserBehavior(user_id=user_id, behavior_id=hid, schedule_type="daily", hour=21, enabled=True))
             db.commit()
-
-        result = upsert_daily_log(db, user_id, d, status)
-
-    if result == "same":
-        reply_text = f"本日分は既に「{'達成' if status=='done' else '未達'}」で記録済みです。"
-    elif result == "updated":
-        reply_text = f"本日分を「{'達成' if status=='done' else '未達'}」に更新しました。"
-    else:  # created
-        reply_text = f"本日分を「{'達成' if status=='done' else '未達'}」で記録しました。"
-
-    with ApiClient(configuration) as api_client:
-        api = MessagingApi(api_client)
-        api.reply_message(
-            ReplyMessageRequest(
-                replyToken=event.reply_token,
-                messages=[TextMessage(text=reply_text)]
+            send_behaviors_page(user_id, book_id, page, db)
+        return
+    if op == "finalize":
+        book_id = params.get("book")
+        with SessionLocal() as db:
+            # 集計してメッセージ
+            q = (select(Behavior.title)
+                 .join(UserBehavior, UserBehavior.behavior_id==Behavior.id)
+                 .where(UserBehavior.user_id==user_id, UserBehavior.enabled==True, Behavior.book_id==book_id))
+            titles = db.execute(q).scalars().all()
+        msg = "選択が完了しました。\n" + (("\n".join([f"・{t}" for t in titles])) if titles else "（選択なし）")
+        msg += "\n\n※ 初期設定は「毎日21:00にリマインド」です。"
+        with ApiClient(configuration) as api_client:
+            MessagingApi(api_client).reply_message(
+                ReplyMessageRequest(replyToken=event.reply_token, messages=[TextMessage(text=msg)])
             )
-        )
+        return
 
 @handler.add(MessageEvent, message=TextMessageContent)
 def on_text(event: MessageEvent):
     user_id = event.source.user_id
     text = (event.message.text or "").strip().lower()
+    # 本選択コマンド
+    if text in ("本", "books", "book", "書籍"):
+        with SessionLocal() as db:
+            if not db.get(User, user_id):
+                db.add(User(user_id=user_id)); db.commit()
+            send_books_quickreply(user_id, db)
+        return
     if text in ("done", "達成", "y", "yes"):
         status = "done"
     elif text in ("skip", "未達", "n", "no"):
@@ -407,3 +448,96 @@ def admin_seed(key: str = Query(...), db: Session = Depends(get_db)):
 
     db.commit()
     return {"books_upserted": b_up, "behaviors_upserted": h_up}
+
+@app.get("/admin/user_behaviors")
+def admin_user_behaviors(key: str = Query(...), db: Session = Depends(get_db)):
+    if key != ADMIN_KEY:
+        raise HTTPException(status_code=403, detail="forbidden")
+    rows = db.execute(
+        select(UserBehavior.user_id, UserBehavior.behavior_id, UserBehavior.enabled,
+               UserBehavior.schedule_type, UserBehavior.hour)
+    ).all()
+    return {"items": [dict(user_id=r.user_id, behavior_id=r.behavior_id, enabled=r.enabled,
+                           schedule_type=r.schedule_type, hour=r.hour) for r in rows]}
+
+# --- postback解析 ---
+def parse_postback(data: str) -> dict:
+    try:
+        return dict(urlparse.parse_qsl(data or ""))
+    except Exception:
+        return {}
+
+# --- 送信ヘルパ ---
+def send_text(user_id: str, text: str):
+    with ApiClient(configuration) as api_client:
+        MessagingApi(api_client).push_message(
+            PushMessageRequest(to=user_id, messages=[TextMessage(text=text)])
+        )
+
+def send_books_quickreply(user_id: str, db: Session):
+    books = db.execute(select(Book).order_by(Book.title)).scalars().all()
+    if not books:
+        send_text(user_id, "（管理者へ）書籍マスタが空です。/admin/seed を実行してください。")
+        return
+    items = []
+    for b in books[:13]:  # QuickReplyは最大13
+        items.append(
+            QuickReplyItem(action=PostbackAction(label=b.title[:20], data=f"op=pick_book&book={b.id}"))
+        )
+    qr = QuickReply(items=items)
+    with ApiClient(configuration) as api_client:
+        MessagingApi(api_client).push_message(
+            PushMessageRequest(
+                to=user_id,
+                messages=[TextMessage(text="本を選んでください：", quickReply=qr)]
+            )
+        )
+
+# --- 本・行動のUI ---
+PAGE_SIZE = 5
+def send_behaviors_page(user_id: str, book_id: str, page: int, db: Session):
+    book = db.get(Book, book_id)
+    if not book:
+        send_text(user_id, "指定の本が見つかりません。")
+        return
+    beh_all = db.execute(select(Behavior).where(Behavior.book_id==book_id).order_by(Behavior.title)).scalars().all()
+    if not beh_all:
+        send_text(user_id, f"『{book.title}』の行動リストが未登録です。")
+        return
+    start = max(0, page*PAGE_SIZE); end = min(len(beh_all), start+PAGE_SIZE)
+    slice_beh = beh_all[start:end]
+    # 選択済み（enabled=1）のセット
+    enabled_ids = set(
+        db.execute(select(UserBehavior.behavior_id)
+                   .where(UserBehavior.user_id==user_id,
+                          UserBehavior.enabled==True)).scalars().all()
+    )
+    lines = [f"行動を選択（トグル）：", f"ページ {page+1}/{(len(beh_all)+PAGE_SIZE-1)//PAGE_SIZE}"]
+    qritems = []
+    for i, h in enumerate(slice_beh, start=1):
+        mark = "☑" if h.id in enabled_ids else "☐"
+        lines.append(f"{i}. {mark} {h.title}")
+        qritems.append(
+            QuickReplyItem(
+                action=PostbackAction(
+                    label=f"{mark} {h.title[:16]}",
+                    data=f"op=toggle&book={book_id}&hid={h.id}&p={page}"
+                )
+            )
+        )
+    # ナビゲーション
+    if end < len(beh_all):
+        qritems.append(QuickReplyItem(action=PostbackAction(label="次へ ▶", data=f"op=pick_book&book={book_id}&p={page+1}")))
+    if page > 0:
+        qritems.append(QuickReplyItem(action=PostbackAction(label="◀ 前へ", data=f"op=pick_book&book={book_id}&p={page-1}")))
+    qritems.append(QuickReplyItem(action=PostbackAction(label="決定", data=f"op=finalize&book={book_id}")))
+    qr = QuickReply(items=qritems[:13])
+    with ApiClient(configuration) as api_client:
+        MessagingApi(api_client).push_message(
+            PushMessageRequest(
+                to=user_id,
+                messages=[TextMessage(text="\n".join(lines), quickReply=qr)]
+            )
+        )
+
+# ---  ---
