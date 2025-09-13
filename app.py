@@ -460,6 +460,13 @@ def admin_user_behaviors(key: str = Query(...), db: Session = Depends(get_db)):
     return {"items": [dict(user_id=r.user_id, behavior_id=r.behavior_id, enabled=r.enabled,
                            schedule_type=r.schedule_type, hour=r.hour) for r in rows]}
 
+@app.get("/admin/books")
+def admin_books(key: str = Query(...), db: Session = Depends(get_db)):
+    if key != ADMIN_KEY:
+        raise HTTPException(status_code=403, detail="forbidden")
+    rows = db.execute(select(Book.id, Book.title)).all()
+    return {"books": [dict(id=r.id, title=r.title) for r in rows]}
+
 # --- postback解析 ---
 def parse_postback(data: str) -> dict:
     try:
