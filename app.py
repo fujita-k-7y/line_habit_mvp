@@ -4,6 +4,7 @@ from io import StringIO
 from datetime import datetime, date
 from zoneinfo import ZoneInfo
 import urllib.parse as urlparse
+import hmac, hashlib, base64
 
 from fastapi import FastAPI, Request, HTTPException, Depends, Query, BackgroundTasks
 from fastapi.responses import JSONResponse, StreamingResponse, PlainTextResponse, RedirectResponse
@@ -177,20 +178,19 @@ def root():
     return RedirectResponse(url="/docs")
 
 # --- Webhook（LINE -> 当アプリ） ---
-@app.post("/webhook")
-async def webhook(request: Request, background_tasks: BackgroundTasks, db: Session = Depends(get_db)):
-    sig = request.headers.get("X-Line-Signature")
-    body = (await request.body()).decode("utf-8")
-    try:
-        # ここでは検証だけして…
-        handler.handle  # 呼ぶのは後ろ
-    except Exception:
-        pass
-    # ← 応答を先に返す
-    resp = PlainTextResponse("OK")
-    # ← 実処理はバックグラウンドへ（sig付きで）
-    background_tasks.add_task(handler.handle, body, sig)
-    return resp
+async def webhook(request: Request, background_tasks: BackgroundTasks):
+    signature = request.headers.get("X-Line-Signature")
+    if not signature:
+        raise HTTPException(status_code=400, detail="Missing signature")
+    body = await request.body()
+    # 署名を高速検証（OKなら処理を後ろへ回す）
+    mac = hmac.new(LINE_CHANNEL_SECRET.encode("utf-8"), body, hashlib.sha256).digest()
+    check = base64.b64encode(mac).decode("utf-8")
+    if not hmac.compare_digest(check, signature):
+        raise HTTPException(status_code=400, detail="Invalid signature")
+    # 実処理はバックグラウンド（replyTokenは~1分有効）
+    background_tasks.add_task(handler.handle, body.decode("utf-8"), signature)
+    return PlainTextResponse("OK")
 
 # --- イベントハンドラ（Follow / Postback / Text） ---
 @handler.add(FollowEvent)

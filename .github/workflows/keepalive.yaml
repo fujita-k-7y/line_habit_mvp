@@ -1,0 +1,12 @@
+name: Keep Alive
+on:
+  schedule:
+    - cron: "*/10 * * * *"   # 10分おき（UTC）
+  workflow_dispatch:
+jobs:
+  ping:
+    runs-on: ubuntu-latest
+    steps:
+      - run: curl -fsS "$HEALTHZ_URL"
+        env:
+          HEALTHZ_URL: ${{ secrets.HEALTHZ_URL }}
