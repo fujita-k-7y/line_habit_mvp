@@ -5,6 +5,7 @@ from datetime import datetime, date
 from zoneinfo import ZoneInfo
 import urllib.parse as urlparse
 import hmac, hashlib, base64
+from datetime import datetime
 
 from fastapi import FastAPI, Request, HTTPException, Depends, Query, BackgroundTasks
 from fastapi.responses import JSONResponse, StreamingResponse, PlainTextResponse, RedirectResponse
@@ -359,6 +360,38 @@ def cron_daily(token: str = Query(...), db: Session = Depends(get_db)):
                 # 個別失敗はスキップ（無効ユーザなど）
                 pass
     return {"pushed": pushed}
+
+def _should_send(u: UserBehavior, now: datetime) -> bool:
+    h = getattr(u, "hour", 21)
+    if u.schedule_type == "daily":
+        return now.hour == h
+    if u.schedule_type == "weekly":
+        wd = now.weekday()  # Mon=0..Sun=6
+        return ((u.days_mask >> wd) & 1) == 1 and now.hour == h
+    if u.schedule_type == "once":
+        return (u.run_at is not None) and abs((u.run_at - now).total_seconds()) <= 300
+    return False
+
+@app.post("/cron/dispatch_test")
+def cron_dispatch_test(token: str = Query(...), when: str | None = Query(None), db: Session = Depends(get_db)):
+    if token != CRON_TOKEN:
+        raise HTTPException(status_code=403, detail="invalid token")
+    now = datetime.now(JST) if not when else datetime.fromisoformat(when).astimezone(JST)
+    ubs = db.execute(select(UserBehavior).where(UserBehavior.enabled==True)).scalars().all()
+    targets = [ub for ub in ubs if _should_send(ub, now)]
+    pushed = 0
+    with ApiClient(configuration) as api_client:
+        api = MessagingApi(api_client)
+        for ub in targets:
+            try:
+                api.push_message(PushMessageRequest(
+                    to=ub.user_id,
+                    messages=[make_checkin_message()]  # まずは共通本文で送付（後で行動別に差し替え可）
+                ))
+                pushed += 1
+            except Exception:
+                pass
+    return {"now": now.isoformat(), "candidates": len(ubs), "pushed": pushed}
 
 # --- 管理用：当日達成率の簡易API ---
 class TodayStats(BaseModel):
