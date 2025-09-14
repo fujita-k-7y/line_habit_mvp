@@ -24,8 +24,7 @@ from linebot.v3.webhooks import MessageEvent, TextMessageContent, FollowEvent, P
 from linebot.v3.messaging import MessagingApi, Configuration, ApiClient
 from linebot.v3.messaging.models import (
     ReplyMessageRequest, PushMessageRequest, TextMessage,
-    QuickReply, QuickReplyItem, PostbackAction, FlexMessage,
-    Carousel, Bubble, Box, Text, Button
+    QuickReply, QuickReplyItem, PostbackAction, FlexMessage
 )
 
 # テーブルモデルおよびSeed API
@@ -414,7 +413,7 @@ def _should_send(u: UserBehavior, now: datetime) -> bool:
     return False
 
 @app.post("/cron/dispatch_test")
-def cron_dispatch_test(token: str = Query(...), when: str | None = Query(None), db: Session = Depends(get_db)):
+def cron_dispatch_test(token: str = Query(...), when: str | None = Query(None), mode: str = Query("flex"), db: Session = Depends(get_db)):
     if token != CRON_TOKEN:
         raise HTTPException(status_code=403, detail="invalid token")
     now = datetime.now(JST) if not when else datetime.fromisoformat(when).astimezone(JST)
@@ -425,10 +424,11 @@ def cron_dispatch_test(token: str = Query(...), when: str | None = Query(None), 
     by_user: dict[str, list[str]] = {}
     for ub in targets:
         by_user.setdefault(ub.user_id, []).append(ub.behavior_id)
+    errors = 0
     with ApiClient(configuration) as api_client:
         api = MessagingApi(api_client)
         for uid, hids in by_user.items():
-            # 行動ID -> (hid,title) に解決
+            # 行動ID -> (hid,title)
             items: List[Tuple[str, str]] = []
             for hid in hids:
                 beh = db.get(Behavior, hid)
@@ -436,12 +436,17 @@ def cron_dispatch_test(token: str = Query(...), when: str | None = Query(None), 
             # 10件ごとに分割して送信
             for pack in _chunks(items, 10):
                 try:
-                    flex = build_flex_for_behaviors(pack)
-                    api.push_message(PushMessageRequest(to=uid, messages=[flex]))
+                    if mode == "text":
+                        txt = "今日の行動チェック\n" + "\n".join([f"・{t}" for _, t in pack])
+                        api.push_message(PushMessageRequest(to=uid, messages=[TextMessage(text=txt)]))
+                    else:
+                        flex = build_flex_for_behaviors(pack)  # ← 後述の修正版を使う
+                        api.push_message(PushMessageRequest(to=uid, messages=[flex]))
                     pushed += 1
-                except Exception:
-                    pass
-    return {"now": now.isoformat(), "candidates": len(ubs), "pushed": pushed}
+                except Exception as e:
+                    errors += 1
+                    import logging; logging.getLogger("app").exception(f"push failed: {e}")
+    return {"now": now.isoformat(), "candidates": len(ubs), "pushed": pushed, "errors": errors, "mode": mode}
 
 # --- 管理用：当日達成率の簡易API ---
 class TodayStats(BaseModel):
@@ -632,27 +637,33 @@ def send_behaviors_page(user_id: str, book_id: str, page: int, db: Session):
 
 # Flex（カルーセル）を組み立てる（最大10バブル/通）
 def build_flex_for_behaviors(items: List[Tuple[str, str]]) -> FlexMessage:
-    bubbles: List[Bubble] = []
+    bubbles = []
     for hid, title in items[:10]:
-        buttons_row = Box(
-            layout="horizontal",
-            spacing="md",
-            contents=[
-                Button(style="primary", height="sm",
-                       action=PostbackAction(label="できた", data=f"op=check&hid={hid}&res=did")),
-                Button(style="secondary", height="sm",
-                       action=PostbackAction(label="できない", data=f"op=check&hid={hid}&res=didnt")),
-                Button(style="secondary", height="sm",
-                       action=PostbackAction(label="パス", data=f"op=check&hid={hid}&res=pass")),
-            ],
-        )
-        body = Box(
-            layout="vertical",
-            spacing="md",
-            contents=[Text(text=title, wrap=True, weight="bold"), buttons_row],
-        )
-        bubbles.append(Bubble(body=body))
-    return FlexMessage(altText="今日の行動チェック", contents=Carousel(contents=bubbles))
+        bubbles.append({
+            "type": "bubble",
+            "body": {
+                "type": "box",
+                "layout": "vertical",
+                "spacing": "md",
+                "contents": [
+                    {"type": "text", "text": title, "wrap": True, "weight": "bold"},
+                    {
+                        "type": "box",
+                        "layout": "horizontal",
+                        "spacing": "md",
+                        "contents": [
+                            {"type":"button","style":"primary","height":"sm",
+                             "action":{"type":"postback","label":"できた","data":f"op=check&hid={hid}&res=did"}},
+                            {"type":"button","style":"secondary","height":"sm",
+                             "action":{"type":"postback","label":"できない","data":f"op=check&hid={hid}&res=didnt"}},
+                            {"type":"button","style":"secondary","height":"sm",
+                             "action":{"type":"postback","label":"パス","data":f"op=check&hid={hid}&res=pass"}}
+                        ]
+                    }
+                ]
+            }
+        })
+    return FlexMessage(altText="今日の行動チェック", contents={"type":"carousel","contents":bubbles})
 
 def _chunks(seq: List, n: int):
     for i in range(0, len(seq), n):
