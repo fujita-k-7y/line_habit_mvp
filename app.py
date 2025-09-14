@@ -24,7 +24,8 @@ from linebot.v3.webhooks import MessageEvent, TextMessageContent, FollowEvent, P
 from linebot.v3.messaging import MessagingApi, Configuration, ApiClient
 from linebot.v3.messaging.models import (
     ReplyMessageRequest, PushMessageRequest, TextMessage,
-    QuickReply, QuickReplyItem, PostbackAction, FlexMessage
+    QuickReply, QuickReplyItem, PostbackAction, FlexMessage,
+    Carousel, Bubble, Box, Text, Button
 )
 
 # テーブルモデルおよびSeed API
@@ -631,33 +632,27 @@ def send_behaviors_page(user_id: str, book_id: str, page: int, db: Session):
 
 # Flex（カルーセル）を組み立てる（最大10バブル/通）
 def build_flex_for_behaviors(items: List[Tuple[str, str]]) -> FlexMessage:
-    bubbles = []
+    bubbles: List[Bubble] = []
     for hid, title in items[:10]:
-        bubbles.append({
-            "type": "bubble",
-            "body": {
-                "type": "box",
-                "layout": "vertical",
-                "spacing": "md",
-                "contents": [
-                    {"type": "text", "text": title, "wrap": True, "weight": "bold"},
-                    {
-                        "type": "box",
-                        "layout": "horizontal",
-                        "spacing": "md",
-                        "contents": [
-                            {"type":"button","style":"primary","height":"sm",
-                             "action":{"type":"postback","label":"できた","data":f"op=check&hid={hid}&res=did"}},
-                            {"type":"button","style":"secondary","height":"sm",
-                             "action":{"type":"postback","label":"できない","data":f"op=check&hid={hid}&res=didnt"}},
-                            {"type":"button","style":"secondary","height":"sm",
-                             "action":{"type":"postback","label":"パス","data":f"op=check&hid={hid}&res=pass"}}
-                        ]
-                    }
-                ]
-            }
-        })
-    return FlexMessage(altText="今日の行動チェック", contents={"type":"carousel","contents":bubbles})
+        buttons_row = Box(
+            layout="horizontal",
+            spacing="md",
+            contents=[
+                Button(style="primary", height="sm",
+                       action=PostbackAction(label="できた", data=f"op=check&hid={hid}&res=did")),
+                Button(style="secondary", height="sm",
+                       action=PostbackAction(label="できない", data=f"op=check&hid={hid}&res=didnt")),
+                Button(style="secondary", height="sm",
+                       action=PostbackAction(label="パス", data=f"op=check&hid={hid}&res=pass")),
+            ],
+        )
+        body = Box(
+            layout="vertical",
+            spacing="md",
+            contents=[Text(text=title, wrap=True, weight="bold"), buttons_row],
+        )
+        bubbles.append(Bubble(body=body))
+    return FlexMessage(altText="今日の行動チェック", contents=Carousel(contents=bubbles))
 
 def _chunks(seq: List, n: int):
     for i in range(0, len(seq), n):
