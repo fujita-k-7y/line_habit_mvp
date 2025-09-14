@@ -21,10 +21,10 @@ from sqlalchemy.orm import declarative_base, Mapped, mapped_column, Session, ses
 from linebot.v3.exceptions import InvalidSignatureError
 from linebot.v3 import WebhookHandler
 from linebot.v3.webhooks import MessageEvent, TextMessageContent, FollowEvent, PostbackEvent
-from linebot.v3.messaging import MessagingApi, Configuration, ApiClient
+from linebot.v3.messaging import MessagingApi, Configuration, ApiClient, ApiException, ErrorResponse
 from linebot.v3.messaging.models import (
     ReplyMessageRequest, PushMessageRequest, TextMessage,
-    QuickReply, QuickReplyItem, PostbackAction, FlexMessage
+    QuickReply, QuickReplyItem, PostbackAction, FlexMessage, FlexContainer
 )
 
 # テーブルモデルおよびSeed API
@@ -440,12 +440,15 @@ def cron_dispatch_test(token: str = Query(...), when: str | None = Query(None), 
                         txt = "今日の行動チェック\n" + "\n".join([f"・{t}" for _, t in pack])
                         api.push_message(PushMessageRequest(to=uid, messages=[TextMessage(text=txt)]))
                     else:
-                        flex = build_flex_for_behaviors(pack)  # ← 後述の修正版を使う
+                        flex = build_flex_for_behaviors(pack)
                         api.push_message(PushMessageRequest(to=uid, messages=[flex]))
                     pushed += 1
+                except ApiException as e:
+                    errors += 1
+                    logger.error(f"push failed: status={e.status} body={e.body}")
                 except Exception as e:
                     errors += 1
-                    import logging; logging.getLogger("app").exception(f"push failed: {e}")
+                    logger.exception(f"push failed: {e}")
     return {"now": now.isoformat(), "candidates": len(ubs), "pushed": pushed, "errors": errors, "mode": mode}
 
 # --- 管理用：当日達成率の簡易API ---
@@ -637,6 +640,7 @@ def send_behaviors_page(user_id: str, book_id: str, page: int, db: Session):
 
 # Flex（カルーセル）を組み立てる（最大10バブル/通）
 def build_flex_for_behaviors(items: List[Tuple[str, str]]) -> FlexMessage:
+    """items: [(hid, title)] を Flex の Carousel JSON にしてから SDK で検証・生成"""
     bubbles = []
     for hid, title in items[:10]:
         bubbles.append({
@@ -663,7 +667,11 @@ def build_flex_for_behaviors(items: List[Tuple[str, str]]) -> FlexMessage:
                 ]
             }
         })
-    return FlexMessage(altText="今日の行動チェック", contents={"type":"carousel","contents":bubbles})
+    contents_json = {"type": "carousel", "contents": bubbles}
+    return FlexMessage(
+        alt_text="今日の行動チェック",
+        contents=FlexContainer.from_json(json.dumps(contents_json))
+    )
 
 def _chunks(seq: List, n: int):
     for i in range(0, len(seq), n):
