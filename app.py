@@ -6,6 +6,7 @@ from zoneinfo import ZoneInfo
 import urllib.parse as urlparse
 import hmac, hashlib, base64, logging
 from datetime import datetime
+from typing import List, Tuple
 
 from fastapi import FastAPI, Request, HTTPException, Depends, Query, BackgroundTasks
 from fastapi.responses import JSONResponse, StreamingResponse, PlainTextResponse, RedirectResponse
@@ -23,7 +24,7 @@ from linebot.v3.webhooks import MessageEvent, TextMessageContent, FollowEvent, P
 from linebot.v3.messaging import MessagingApi, Configuration, ApiClient
 from linebot.v3.messaging.models import (
     ReplyMessageRequest, PushMessageRequest, TextMessage,
-    QuickReply, QuickReplyItem, PostbackAction
+    QuickReply, QuickReplyItem, PostbackAction, FlexMessage
 )
 
 # テーブルモデルおよびSeed API
@@ -297,6 +298,39 @@ def on_postback(event: PostbackEvent):
             )
         return
 
+    # 3択（できた/できない/パス）の記録
+    if op == "check":
+        hid = params.get("hid")
+        res = params.get("res")
+        if res not in ("did", "didnt", "pass") or not hid:
+            # 不正なデータは黙って捨てる
+            with ApiClient(configuration) as api_client:
+                MessagingApi(api_client).reply_message(
+                    ReplyMessageRequest(replyToken=event.reply_token, messages=[TextMessage(text="入力を解釈できませんでした。")])
+                )
+            return
+        d = today_jst()
+        with SessionLocal() as db:
+            if not db.get(User, user_id):
+                db.add(User(user_id=user_id)); db.commit()
+            row = db.execute(select(Checkin).where(
+                Checkin.user_id==user_id, Checkin.behavior_id==hid, Checkin.date==d
+            )).scalar_one_or_none()
+            if row:
+                if row.result == res:
+                    msg = "本日分は同じ結果で記録済みです。"
+                else:
+                    row.result = res; db.commit()
+                    msg = "本日分を更新しました。"
+            else:
+                db.add(Checkin(user_id=user_id, behavior_id=hid, date=d, result=res)); db.commit()
+                msg = "本日分を記録しました。"
+        with ApiClient(configuration) as api_client:
+            MessagingApi(api_client).reply_message(
+                ReplyMessageRequest(replyToken=event.reply_token, messages=[TextMessage(text=msg)])
+            )
+        return
+
 @handler.add(MessageEvent, message=TextMessageContent)
 def on_text(event: MessageEvent):
     user_id = event.source.user_id
@@ -386,17 +420,26 @@ def cron_dispatch_test(token: str = Query(...), when: str | None = Query(None), 
     ubs = db.execute(select(UserBehavior).where(UserBehavior.enabled==True)).scalars().all()
     targets = [ub for ub in ubs if _should_send(ub, now)]
     pushed = 0
+    # ユーザーごとにひとまとめ（1通=最大10バブル）
+    by_user: dict[str, list[str]] = {}
+    for ub in targets:
+        by_user.setdefault(ub.user_id, []).append(ub.behavior_id)
     with ApiClient(configuration) as api_client:
         api = MessagingApi(api_client)
-        for ub in targets:
-            try:
-                api.push_message(PushMessageRequest(
-                    to=ub.user_id,
-                    messages=[make_checkin_message()]  # まずは共通本文で送付（後で行動別に差し替え可）
-                ))
-                pushed += 1
-            except Exception:
-                pass
+        for uid, hids in by_user.items():
+            # 行動ID -> (hid,title) に解決
+            items: List[Tuple[str, str]] = []
+            for hid in hids:
+                beh = db.get(Behavior, hid)
+                items.append((hid, beh.title if beh else "（行動）"))
+            # 10件ごとに分割して送信
+            for pack in _chunks(items, 10):
+                try:
+                    flex = build_flex_for_behaviors(pack)
+                    api.push_message(PushMessageRequest(to=uid, messages=[flex]))
+                    pushed += 1
+                except Exception:
+                    pass
     return {"now": now.isoformat(), "candidates": len(ubs), "pushed": pushed}
 
 # --- 管理用：当日達成率の簡易API ---
@@ -586,4 +629,36 @@ def send_behaviors_page(user_id: str, book_id: str, page: int, db: Session):
             )
         )
 
-# ---  ---
+# Flex（カルーセル）を組み立てる（最大10バブル/通）
+def build_flex_for_behaviors(items: List[Tuple[str, str]]) -> FlexMessage:
+    bubbles = []
+    for hid, title in items[:10]:
+        bubbles.append({
+            "type": "bubble",
+            "body": {
+                "type": "box",
+                "layout": "vertical",
+                "spacing": "md",
+                "contents": [
+                    {"type": "text", "text": title, "wrap": True, "weight": "bold"},
+                    {
+                        "type": "box",
+                        "layout": "horizontal",
+                        "spacing": "md",
+                        "contents": [
+                            {"type":"button","style":"primary","height":"sm",
+                             "action":{"type":"postback","label":"できた","data":f"op=check&hid={hid}&res=did"}},
+                            {"type":"button","style":"secondary","height":"sm",
+                             "action":{"type":"postback","label":"できない","data":f"op=check&hid={hid}&res=didnt"}},
+                            {"type":"button","style":"secondary","height":"sm",
+                             "action":{"type":"postback","label":"パス","data":f"op=check&hid={hid}&res=pass"}}
+                        ]
+                    }
+                ]
+            }
+        })
+    return FlexMessage(altText="今日の行動チェック", contents={"type":"carousel","contents":bubbles})
+
+def _chunks(seq: List, n: int):
+    for i in range(0, len(seq), n):
+        yield seq[i:i+n]
