@@ -7,6 +7,7 @@ import urllib.parse as urlparse
 import hmac, hashlib, base64, logging
 from datetime import datetime
 from typing import List, Tuple
+import random, calendar
 
 from fastapi import FastAPI, Request, HTTPException, Depends, Query, BackgroundTasks
 from fastapi.responses import JSONResponse, StreamingResponse, PlainTextResponse, RedirectResponse
@@ -42,6 +43,9 @@ LINE_ACCESS_TOKEN = os.getenv("LINE_CHANNEL_ACCESS_TOKEN", "")
 
 if not LINE_CHANNEL_SECRET or not LINE_ACCESS_TOKEN:
     print("[warn] LINEの環境変数が未設定です（Step1未完了なら無視OK）")
+
+
+logger = logging.getLogger("app")
 
 # ============= FastAPI =============
 app = FastAPI(title="LINE Habit MVP", version="0.1.0")
@@ -558,6 +562,57 @@ def admin_books(key: str = Query(...), db: Session = Depends(get_db)):
     rows = db.execute(select(Book.id, Book.title)).all()
     return {"books": [dict(id=r.id, title=r.title) for r in rows]}
 
+@app.post("/admin/simulate_day")
+def admin_simulate_day(
+    key: str = Query(...),
+    d: str = Query(..., description="YYYY-MM-DD"),
+    rate: float = Query(0.75, ge=0.0, le=1.0),
+    pass_rate: float = Query(0.1, ge=0.0, le=1.0),
+    db: Session = Depends(get_db)
+):
+    """有効な user_behaviors 全件に対し、その日のチェックインを一括生成（既存は上書き）"""
+    if key != ADMIN_KEY:
+        raise HTTPException(status_code=403, detail="forbidden")
+    day = date.fromisoformat(d)
+    ubs = db.execute(select(UserBehavior).where(UserBehavior.enabled==True)).scalars().all()
+    did, didnt, passed = 0, 0, 0
+    for ub in ubs:
+        r = random.random()
+        if r < rate:
+            res = "did"; did += 1
+        elif r < rate + pass_rate:
+            res = "pass"; passed += 1
+        else:
+            res = "didnt"; didnt += 1
+        row = db.execute(select(Checkin).where(
+            Checkin.user_id==ub.user_id, Checkin.behavior_id==ub.behavior_id, Checkin.date==day
+        )).scalar_one_or_none()
+        if row:
+            row.result = res
+        else:
+            db.add(Checkin(user_id=ub.user_id, behavior_id=ub.behavior_id, date=day, result=res))
+    db.commit()
+    return {"date": day.isoformat(), "targets": len(ubs), "did": did, "didnt": didnt, "pass": passed}
+
+@app.post("/admin/simulate_month")
+def admin_simulate_month(
+    key: str = Query(...),
+    ym: str = Query(..., description="YYYY-MM"),
+    rate: float = Query(0.75, ge=0.0, le=1.0),
+    pass_rate: float = Query(0.1, ge=0.0, le=1.0),
+    db: Session = Depends(get_db)
+):
+    """その月の全日について simulate_day を回す（高速デモ用）"""
+    if key != ADMIN_KEY:
+        raise HTTPException(status_code=403, detail="forbidden")
+    start, end = month_range(ym)
+    total_targets = 0
+    for i in range((end - start).days + 1):
+        day = (start + timedelta(days=i)).isoformat()
+        resp = admin_simulate_day(key=key, d=day, rate=rate, pass_rate=pass_rate, db=db)
+        total_targets += resp["targets"]
+    return {"ym": ym, "days": (end-start).days + 1, "avg_targets_per_day": total_targets/((end-start).days + 1)}
+
 # --- postback解析 ---
 def parse_postback(data: str) -> dict:
     try:
@@ -676,3 +731,77 @@ def build_flex_for_behaviors(items: List[Tuple[str, str]]) -> FlexMessage:
 def _chunks(seq: List, n: int):
     for i in range(0, len(seq), n):
         yield seq[i:i+n]
+
+# --- 月次サマリ(JSON & push) ---
+def summarize_user_month(db: Session, user_id: str, ym: str):
+    start, end = month_range(ym)
+    q = (select(Checkin.behavior_id, Behavior.title,
+                func.sum(case((Checkin.result=="did", 1), else_=0)).label("did"),
+                func.sum(case((Checkin.result=="didnt", 1), else_=0)).label("didnt"),
+                func.sum(case((Checkin.result=="pass", 1), else_=0)).label("pass"),
+                func.count().label("days"))
+         .join(Behavior, Behavior.id==Checkin.behavior_id)
+         .where(Checkin.user_id==user_id, Checkin.date>=start, Checkin.date<=end)
+         .group_by(Checkin.behavior_id, Behavior.title))
+    rows = db.execute(q).all()
+    items = []
+    for r in rows:
+        done = int(r.did or 0); skipped = int(r.didnt or 0); pss = int(r.pass or 0)
+        total = done + skipped + pss
+        rate = (done / total) if total else 0.0
+        items.append({
+            "behavior_id": r.behavior_id,
+            "title": r.title,
+            "did": done, "didnt": skipped, "pass": pss,
+            "total": total,
+            "rate": round(rate*100, 1),
+            "grade": grade_by_rate(rate)
+        })
+    # rate降順で並べる
+    items.sort(key=lambda x: (-x["rate"], -x["did"], x["title"]))
+    return items
+
+@app.get("/admin/monthly_summary")
+def admin_monthly_summary(key: str = Query(...), ym: str = Query(...), user_id: str | None = Query(None), db: Session = Depends(get_db)):
+    if key != ADMIN_KEY:
+        raise HTTPException(status_code=403, detail="forbidden")
+    if user_id:
+        return {"ym": ym, "user_id": user_id, "items": summarize_user_month(db, user_id, ym)}
+    # 全ユーザー
+    users = db.execute(select(User.user_id)).scalars().all()
+    return {"ym": ym, "users": {uid: summarize_user_month(db, uid, ym) for uid in users}}
+
+def build_monthly_text(ym: str, items: List[dict]) -> str:
+    s = [f"{ym} のサマリ"]
+    for it in items[:5]:  # 上位5件だけ
+        s.append(f"☑ {it['title']}\n  実行日数 {it['did']}/{it['total']}  継続率 {it['rate']}%  評価 {it['grade']}")
+    return "\n".join(s) if len(items) else f"{ym} の記録がありません。"
+
+@app.post("/admin/push_monthly")
+def admin_push_monthly(key: str = Query(...), ym: str = Query(...), db: Session = Depends(get_db)):
+    if key != ADMIN_KEY:
+        raise HTTPException(status_code=403, detail="forbidden")
+    users = db.execute(select(User.user_id)).scalars().all()
+    pushed, errors = 0, 0
+    with ApiClient(configuration) as api_client:
+        api = MessagingApi(api_client)
+        for uid in users:
+            items = summarize_user_month(db, uid, ym)
+            try:
+                api.push_message(PushMessageRequest(to=uid, messages=[TextMessage(text=build_monthly_text(ym, items))]))
+                pushed += 1
+            except ApiException as e:
+                errors += 1; logger.error(f"push monthly failed: status={e.status} body={e.body}")
+            except Exception as e:
+                errors += 1; logger.exception(f"push monthly failed: {e}")
+    return {"ym": ym, "users": len(users), "pushed": pushed, "errors": errors}
+
+# --- ユーティリティ(月の範囲・評価) ---
+def month_range(ym: str) -> tuple[date, date]:
+    """'YYYY-MM' -> (first_date, last_date)"""
+    y, m = map(int, ym.split("-"))
+    last = calendar.monthrange(y, m)[1]
+    return date(y, m, 1), date(y, m, last)
+
+def grade_by_rate(rate: float) -> str:
+    return "S" if rate >= 0.9 else ("A" if rate >= 0.7 else ("B" if rate >= 0.5 else "C"))
