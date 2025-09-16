@@ -1,0 +1,34 @@
+name: Monthly Dummy + Push
+on:
+  workflow_dispatch:
+    inputs:
+      ym:
+        description: "YYYY-MM (dummy month)"
+        required: true
+        default: "2025-09"
+      rate:
+        description: "success rate (0~1)"
+        required: true
+        default: "0.75"
+      pass_rate:
+        description: "pass rate (0~1)"
+        required: true
+        default: "0.10"
+jobs:
+  simulate_and_push:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Simulate month
+        env:
+          URL: ${{ secrets.SIM_MONTH_URL }}   # e.g. https://<domain>/admin/simulate_month?key=dev-admin-key
+          YM:  ${{ github.event.inputs.ym }}
+          RATE: ${{ github.event.inputs.rate }}
+          PASS: ${{ github.event.inputs.pass_rate }}
+        run: |
+          curl -fsS -X POST "$URL&ym=$YM&rate=$RATE&pass_rate=$PASS"
+      - name: Push monthly summary
+        env:
+          URL: ${{ secrets.PUSH_MONTHLY_URL }} # e.g. https://<domain>/admin/push_monthly?key=dev-admin-key
+          YM:  ${{ github.event.inputs.ym }}
+        run: |
+          curl -fsS -X POST "$URL&ym=$YM"

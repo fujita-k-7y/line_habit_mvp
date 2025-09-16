@@ -1,0 +1,19 @@
+name: Burst Daily (10m)
+on:
+  workflow_dispatch:
+    inputs:
+      url:
+        description: "dispatch_test URL (with token)"
+        required: true
+        default: "https://<your-domain>/cron/dispatch_test?token=dev-cron-token&mode=flex&when=2025-09-13T21:00:00"
+jobs:
+  burst:
+    runs-on: ubuntu-latest
+    steps:
+      - name: 10 times every 60s
+        run: |
+          for i in $(seq 1 10); do
+            echo "[$i/10] $(date -u) hitting..."
+            curl -fsS -X POST "${{ github.event.inputs.url }}" || true
+            sleep 60
+          done
