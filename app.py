@@ -1,11 +1,10 @@
 import os
 import csv
 from io import StringIO
-from datetime import datetime, date
+from datetime import datetime, date, timedelta
 from zoneinfo import ZoneInfo
 import urllib.parse as urlparse
 import hmac, hashlib, base64, logging
-from datetime import datetime
 from typing import List, Tuple
 import random, calendar
 
@@ -15,7 +14,7 @@ from pydantic import BaseModel
 from dotenv import load_dotenv
 
 from sqlalchemy import (create_engine, String, DateTime, Date, Integer, ForeignKey,
-                        UniqueConstraint, select, func)
+                        UniqueConstraint, select, func, case)
 from sqlalchemy.orm import declarative_base, Mapped, mapped_column, Session, sessionmaker, relationship
 
 # --- LINE SDK (v3) ---
@@ -420,7 +419,13 @@ def _should_send(u: UserBehavior, now: datetime) -> bool:
 def cron_dispatch_test(token: str = Query(...), when: str | None = Query(None), mode: str = Query("flex"), db: Session = Depends(get_db)):
     if token != CRON_TOKEN:
         raise HTTPException(status_code=403, detail="invalid token")
-    now = datetime.now(JST) if not when else datetime.fromisoformat(when).astimezone(JST)
+    if not when:
+        now = datetime.now(JST)
+    else:
+        dt = datetime.fromisoformat(when)
+        if dt.tzinfo is None:
+            dt = dt.replace(tzinfo=JST)  # naiveならJSTとして扱う
+        now = dt.astimezone(JST)
     ubs = db.execute(select(UserBehavior).where(UserBehavior.enabled==True)).scalars().all()
     targets = [ub for ub in ubs if _should_send(ub, now)]
     pushed = 0
@@ -738,7 +743,7 @@ def summarize_user_month(db: Session, user_id: str, ym: str):
     q = (select(Checkin.behavior_id, Behavior.title,
                 func.sum(case((Checkin.result=="did", 1), else_=0)).label("did"),
                 func.sum(case((Checkin.result=="didnt", 1), else_=0)).label("didnt"),
-                func.sum(case((Checkin.result=="pass", 1), else_=0)).label("pass"),
+                func.sum(case((Checkin.result=="pass", 1), else_=0)).label("pass_cnt"),
                 func.count().label("days"))
          .join(Behavior, Behavior.id==Checkin.behavior_id)
          .where(Checkin.user_id==user_id, Checkin.date>=start, Checkin.date<=end)
@@ -746,7 +751,7 @@ def summarize_user_month(db: Session, user_id: str, ym: str):
     rows = db.execute(q).all()
     items = []
     for r in rows:
-        done = int(r.did or 0); skipped = int(r.didnt or 0); pss = int(r.pass or 0)
+        done = int(r.did or 0); skipped = int(r.didnt or 0); pss = int(r.pass_cnt or 0)
         total = done + skipped + pss
         rate = (done / total) if total else 0.0
         items.append({
