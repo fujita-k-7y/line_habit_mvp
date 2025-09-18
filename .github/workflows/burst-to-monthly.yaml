@@ -1,0 +1,39 @@
+name: Burst → Auto Checkin → Monthly Push
+
+on:
+  workflow_dispatch:
+    inputs:
+      url:
+        description: "dispatch_test URL (with token)"
+        required: true
+        default: "https://line-habit-mvp.onrender.com/cron/dispatch_test?token=dev-cron-token&mode=flex&when=2025-09-18T21:00:00"
+      ym:
+        description: "YYYY-MM for summary"
+        required: true
+        default: "2025-09"
+      day:
+        description: "YYYY-MM-DD to auto checkin"
+        required: true
+        default: "2025-09-18"
+
+jobs:
+  run:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Burst 10 times (every 60s)
+        run: |
+          for i in $(seq 1 10); do
+            echo "[$i/10] hitting dispatch_test..."
+            curl -fsS -X POST "${{ github.event.inputs.url }}" || true
+            sleep 60
+          done
+      - name: Auto checkin (simulate today's results)
+        env:
+          SIM_DAY_URL: ${{ secrets.SIM_DAY_URL }}   # e.g. https://line-habit-mvp.onrender.com/admin/simulate_day?key=dev-admin-key
+        run: |
+          curl -fsS -X POST "$SIM_DAY_URL&d=${{ github.event.inputs.day }}&rate=0.8&pass_rate=0.1"
+      - name: Push monthly summary
+        env:
+          PUSH_MONTHLY_URL: ${{ secrets.PUSH_MONTHLY_URL }} # e.g. https://line-habit-mvp.onrender.com/admin/push_monthly?key=dev-admin-key
+        run: |
+          curl -fsS -X POST "$PUSH_MONTHLY_URL&ym=${{ github.event.inputs.ym }}"
