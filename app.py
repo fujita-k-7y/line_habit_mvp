@@ -57,6 +57,19 @@ engine = create_engine(
 )
 SessionLocal = sessionmaker(bind=engine, autoflush=False, autocommit=False, expire_on_commit=False)
 
+
+# 既存のimportsの近く（CheckConstraintは既にimport済み）
+class CheckinEvent(Base):
+    __tablename__ = "checkin_events"
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    user_id: Mapped[str] = mapped_column(String, index=True)
+    behavior_id: Mapped[str] = mapped_column(String, ForeignKey("behaviors.id"), index=True)
+    date: Mapped[date] = mapped_column(Date, index=True)  # JSTの“日付”
+    result: Mapped[str] = mapped_column(String)           # 'did'|'didnt'|'pass'
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=lambda: datetime.now(JST))
+    __table_args__ = (CheckConstraint("result in ('did','didnt','pass')", name="ck_event_result"),)
+
+
 class User(Base):
     __tablename__ = "users"
     user_id: Mapped[str] = mapped_column(String, primary_key=True)
@@ -321,13 +334,16 @@ def on_postback(event: PostbackEvent):
             )).scalar_one_or_none()
             if row:
                 if row.result == res:
-                    msg = "本日分は同じ結果で記録済みです。"
+                    msg = "本日分は同じ結果で記録済みです。（追記も行いました）"
                 else:
-                    row.result = res; db.commit()
-                    msg = "本日分を更新しました。"
+                    row.result = res
+                    msg = "本日分を更新しました。（追記も行いました）"
             else:
-                db.add(Checkin(user_id=user_id, behavior_id=hid, date=d, result=res)); db.commit()
-                msg = "本日分を記録しました。"
+                db.add(Checkin(user_id=user_id, behavior_id=hid, date=d, result=res))
+                msg = "本日分を記録しました。（追記も行いました）"
+            # 追加：タップの“イベント”を1行追記
+            db.add(CheckinEvent(user_id=user_id, behavior_id=hid, date=d, result=res))
+            db.commit()
         with ApiClient(configuration) as api_client:
             MessagingApi(api_client).reply_message(
                 ReplyMessageRequest(replyToken=event.reply_token, messages=[TextMessage(text=msg)])
@@ -573,6 +589,7 @@ def admin_simulate_day(
     d: str = Query(..., description="YYYY-MM-DD"),
     rate: float = Query(0.75, ge=0.0, le=1.0),
     pass_rate: float = Query(0.1, ge=0.0, le=1.0),
+    times: int = Query(1, ge=1, le=60),
     db: Session = Depends(get_db)
 ):
     """有効な user_behaviors 全件に対し、その日のチェックインを一括生成（既存は上書き）"""
@@ -582,22 +599,28 @@ def admin_simulate_day(
     ubs = db.execute(select(UserBehavior).where(UserBehavior.enabled==True)).scalars().all()
     did, didnt, passed = 0, 0, 0
     for ub in ubs:
-        r = random.random()
-        if r < rate:
-            res = "did"; did += 1
-        elif r < rate + pass_rate:
-            res = "pass"; passed += 1
-        else:
-            res = "didnt"; didnt += 1
+        last_res = None
+        for _ in range(times):
+            r = random.random()
+            if r < rate:
+                res = "did"; did += 1
+            elif r < rate + pass_rate:
+                res = "pass"; passed += 1
+            else:
+                res = "didnt"; didnt += 1
+            # 追記イベント
+            db.add(CheckinEvent(user_id=ub.user_id, behavior_id=ub.behavior_id, date=day, result=res))
+            last_res = res
+        # 日次サマリは最後の結果で更新
         row = db.execute(select(Checkin).where(
             Checkin.user_id==ub.user_id, Checkin.behavior_id==ub.behavior_id, Checkin.date==day
         )).scalar_one_or_none()
         if row:
-            row.result = res
+            row.result = last_res
         else:
-            db.add(Checkin(user_id=ub.user_id, behavior_id=ub.behavior_id, date=day, result=res))
+            db.add(Checkin(user_id=ub.user_id, behavior_id=ub.behavior_id, date=day, result=last_res))
     db.commit()
-    return {"date": day.isoformat(), "targets": len(ubs), "did": did, "didnt": didnt, "pass": passed}
+    return {"date": day.isoformat(), "targets": len(ubs), "events_per_target": times, "did": did, "didnt": didnt, "pass": passed}
 
 @app.post("/admin/simulate_month")
 def admin_simulate_month(
@@ -605,6 +628,7 @@ def admin_simulate_month(
     ym: str = Query(..., description="YYYY-MM"),
     rate: float = Query(0.75, ge=0.0, le=1.0),
     pass_rate: float = Query(0.1, ge=0.0, le=1.0),
+    times: int = Query(1, ge=1, le=60),
     db: Session = Depends(get_db)
 ):
     """その月の全日について simulate_day を回す（高速デモ用）"""
@@ -614,9 +638,14 @@ def admin_simulate_month(
     total_targets = 0
     for i in range((end - start).days + 1):
         day = (start + timedelta(days=i)).isoformat()
-        resp = admin_simulate_day(key=key, d=day, rate=rate, pass_rate=pass_rate, db=db)
+        resp = admin_simulate_day(key=key, d=day, rate=rate, pass_rate=pass_rate, times=times, db=db)
         total_targets += resp["targets"]
-    return {"ym": ym, "days": (end-start).days + 1, "avg_targets_per_day": total_targets/((end-start).days + 1)}
+    return {
+        "ym": ym,
+        "days": (end-start).days + 1,
+        "avg_targets_per_day": total_targets/((end-start).days + 1),
+        "events_per_target": times
+    }
 
 # --- postback解析 ---
 def parse_postback(data: str) -> dict:
@@ -740,19 +769,19 @@ def _chunks(seq: List, n: int):
 # --- 月次サマリ(JSON & push) ---
 def summarize_user_month(db: Session, user_id: str, ym: str):
     start, end = month_range(ym)
-    q = (select(Checkin.behavior_id, Behavior.title,
-                func.sum(case((Checkin.result=="did", 1), else_=0)).label("did"),
-                func.sum(case((Checkin.result=="didnt", 1), else_=0)).label("didnt"),
-                func.sum(case((Checkin.result=="pass", 1), else_=0)).label("pass_cnt"),
-                func.count().label("days"))
-         .join(Behavior, Behavior.id==Checkin.behavior_id)
-         .where(Checkin.user_id==user_id, Checkin.date>=start, Checkin.date<=end)
-         .group_by(Checkin.behavior_id, Behavior.title))
+    q = (select(CheckinEvent.behavior_id, Behavior.title,
+                func.sum(case((CheckinEvent.result=="did", 1), else_=0)).label("did"),
+                func.sum(case((CheckinEvent.result=="didnt", 1), else_=0)).label("didnt"),
+                func.sum(case((CheckinEvent.result=="pass", 1), else_=0)).label("pass_cnt"),
+                func.count().label("events"))
+         .join(Behavior, Behavior.id==CheckinEvent.behavior_id)
+         .where(CheckinEvent.user_id==user_id, CheckinEvent.date>=start, CheckinEvent.date<=end)
+         .group_by(CheckinEvent.behavior_id, Behavior.title))
     rows = db.execute(q).all()
     items = []
     for r in rows:
         done = int(r.did or 0); skipped = int(r.didnt or 0); pss = int(r.pass_cnt or 0)
-        total = done + skipped + pss
+        total = int(r.events or 0)
         rate = (done / total) if total else 0.0
         items.append({
             "behavior_id": r.behavior_id,
@@ -777,9 +806,12 @@ def admin_monthly_summary(key: str = Query(...), ym: str = Query(...), user_id: 
     return {"ym": ym, "users": {uid: summarize_user_month(db, uid, ym) for uid in users}}
 
 def build_monthly_text(ym: str, items: List[dict]) -> str:
-    s = [f"{ym} のサマリ"]
+    s = [f"{ym} のサマリ（応答回数ベース）"]
     for it in items[:5]:  # 上位5件だけ
-        s.append(f"☑ {it['title']}\n  実行日数 {it['did']}/{it['total']}  継続率 {it['rate']}%  評価 {it['grade']}")
+        s.append(
+            f"☑ {it['title']}\n"
+            f"  実行回数 {it['did']}/{it['total']}  達成率 {it['rate']}%  評価 {it['grade']}"
+        )
     return "\n".join(s) if len(items) else f"{ym} の記録がありません。"
 
 @app.post("/admin/push_monthly")
