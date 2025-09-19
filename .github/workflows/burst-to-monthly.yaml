@@ -1,12 +1,11 @@
 name: Burst → Auto Checkin → Monthly Push
-
 on:
   workflow_dispatch:
     inputs:
       url:
         description: "dispatch_test URL (with token)"
         required: true
-        default: "https://line-habit-mvp.onrender.com/cron/dispatch_test?token=dev-cron-token&mode=flex&when=2025-09-18T21:00:00"
+        default: "https://<domain>/cron/dispatch_test?token=dev-cron-token&mode=flex&when=2025-09-18T21:00:00"
       ym:
         description: "YYYY-MM for summary"
         required: true
@@ -15,25 +14,33 @@ on:
         description: "YYYY-MM-DD to auto checkin"
         required: true
         default: "2025-09-18"
+      interval:
+        description: "Interval seconds between bursts"
+        required: true
+        default: "10"
+      times:
+        description: "How many bursts / events per target"
+        required: true
+        default: "10"
 
 jobs:
   run:
     runs-on: ubuntu-latest
     steps:
-      - name: Burst 10 times (every 60s)
+      - name: Burst (N times every interval sec)
         run: |
-          for i in $(seq 1 10); do
-            echo "[$i/10] hitting dispatch_test..."
+          for i in $(seq 1 ${{ github.event.inputs.times }}); do
+            echo "[$i/${{ github.event.inputs.times }}] hitting dispatch_test..."
             curl -fsS -X POST "${{ github.event.inputs.url }}" || true
-            sleep 60
+            sleep ${{ github.event.inputs.interval }}
           done
-      - name: Auto checkin (simulate today's results)
+      - name: Auto checkin (simulate multiple events)
         env:
-          SIM_DAY_URL: ${{ secrets.SIM_DAY_URL }}   # e.g. https://line-habit-mvp.onrender.com/admin/simulate_day?key=dev-admin-key
+          SIM_DAY_URL: ${{ secrets.SIM_DAY_URL }}   # https://<domain>/admin/simulate_day?key=dev-admin-key
         run: |
-          curl -fsS -X POST "$SIM_DAY_URL&d=${{ github.event.inputs.day }}&rate=0.8&pass_rate=0.1"
+          curl -fsS -X POST "$SIM_DAY_URL&d=${{ github.event.inputs.day }}&rate=0.8&pass_rate=0.1&times=${{ github.event.inputs.times }}"
       - name: Push monthly summary
         env:
-          PUSH_MONTHLY_URL: ${{ secrets.PUSH_MONTHLY_URL }} # e.g. https://line-habit-mvp.onrender.com/admin/push_monthly?key=dev-admin-key
+          PUSH_MONTHLY_URL: ${{ secrets.PUSH_MONTHLY_URL }} # https://<domain>/admin/push_monthly?key=dev-admin-key
         run: |
           curl -fsS -X POST "$PUSH_MONTHLY_URL&ym=${{ github.event.inputs.ym }}"
