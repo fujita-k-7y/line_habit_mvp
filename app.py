@@ -77,8 +77,8 @@ class CheckinPrompt(Base):
     behavior_id: Mapped[str] = mapped_column(String, ForeignKey("behaviors.id"), index=True)
     date: Mapped[date] = mapped_column(Date, index=True)   # 通知日のJST日付
     created_at: Mapped[datetime] = mapped_column(DateTime, default=lambda: datetime.now(JST))
-    # 同じ日に同じ行動へ複数回は基本送らない想定
-    __table_args__ = (UniqueConstraint("user_id", "behavior_id", "date", name="uq_prompt_udb"),)
+    # ※ 一意制約は付けない（同日に複数回通知しても分母として数える）
+    __table_args__ = ()
 
 class User(Base):
     __tablename__ = "users"
@@ -444,7 +444,7 @@ def cron_daily(token: str = Query(...), db: Session = Depends(get_db)):
         today = datetime.now(JST).date()
         ubs = db.execute(select(UserBehavior).where(UserBehavior.enabled==True, UserBehavior.user_id.in_(users))).scalars().all()
         for ub in ubs:
-            ensure_prompt(db, ub.user_id, ub.behavior_id, today)
+            add_prompt(db, ub.user_id, ub.behavior_id, today)
         db.commit()
     return {"pushed": pushed}
 
@@ -505,7 +505,7 @@ def cron_dispatch_test(token: str = Query(...), when: str | None = Query(None), 
             # 分母：このユーザーに対して通知した全行動ID分、当日付で1件ずつログ
             dday = now.date()
             for hid in hids:
-                ensure_prompt(db, uid, hid, dday)
+                add_prompt(db, uid, hid, dday)
     db.commit()
     return {"now": now.isoformat(), "candidates": len(ubs), "pushed": pushed, "errors": errors, "mode": mode}
 
@@ -767,6 +767,36 @@ def admin_monthly_totals_debug(key: str = Query(...), ym: str = Query(...), user
         "pass": int(row.pass_cnt or 0),
     }
 
+@app.post("/admin/migrate_prompts_v2")
+def admin_migrate_prompts_v2(key: str = Query(...), db: Session = Depends(get_db)):
+    """checkin_prompts から一意制約を外した v2 スキーマへ移行（SQLiteのみ想定）"""
+    if key != ADMIN_KEY:
+        raise HTTPException(status_code=403, detail="forbidden")
+    from sqlalchemy import text
+    # 1) v2 テーブル作成（無制約）
+    db.execute(text("""
+        CREATE TABLE IF NOT EXISTS checkin_prompts_v2 (
+          id INTEGER PRIMARY KEY AUTOINCREMENT,
+          user_id TEXT,
+          behavior_id TEXT,
+          date DATE,
+          created_at DATETIME
+        );
+    """))
+    # 2) 旧テーブルがあれば中身をコピー
+    try:
+        db.execute(text("""
+            INSERT INTO checkin_prompts_v2 (user_id, behavior_id, date, created_at)
+            SELECT user_id, behavior_id, date, created_at FROM checkin_prompts;
+        """))
+    except Exception:
+        pass  # 初回など旧テーブルが無い場合は無視
+    # 3) 旧テーブルをリネーム退避 → v2 を正式名に
+    db.execute(text("DROP TABLE IF EXISTS checkin_prompts_old;"))
+    db.execute(text("ALTER TABLE IF EXISTS checkin_prompts RENAME TO checkin_prompts_old;"))
+    db.execute(text("ALTER TABLE checkin_prompts_v2 RENAME TO checkin_prompts;"))
+    db.commit()
+    return {"status": "ok", "message": "checkin_prompts migrated to v2 (no unique constraint)."}
 
 # --- postback解析 ---
 def parse_postback(data: str) -> dict:
@@ -887,17 +917,9 @@ def _chunks(seq: List, n: int):
     for i in range(0, len(seq), n):
         yield seq[i:i+n]
 
-def ensure_prompt(db: Session, user_id: str, behavior_id: str, d: date):
-    """同一日付の通知ログが無ければ1行作成（分母）。"""
-    exists = db.execute(
-        select(CheckinPrompt.id).where(
-            CheckinPrompt.user_id == user_id,
-            CheckinPrompt.behavior_id == behavior_id,
-            CheckinPrompt.date == d
-        )
-    ).first()
-    if not exists:
-        db.add(CheckinPrompt(user_id=user_id, behavior_id=behavior_id, date=d))
+def add_prompt(db: Session, user_id: str, behavior_id: str, d: date):
+    """常に1行追加（同日複数でも分母としてカウントする）"""
+    db.add(CheckinPrompt(user_id=user_id, behavior_id=behavior_id, date=d))
 
 # --- 月次サマリ(JSON & push) ---
 def summarize_user_month(db: Session, user_id: str, ym: str):
