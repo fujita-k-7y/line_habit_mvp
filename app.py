@@ -14,7 +14,7 @@ from pydantic import BaseModel
 from dotenv import load_dotenv
 
 from sqlalchemy import (create_engine, String, DateTime, Date, Integer, ForeignKey,
-                        UniqueConstraint, select, func, case)
+                        UniqueConstraint, select, func, case, literal)
 from sqlalchemy.orm import declarative_base, Mapped, mapped_column, Session, sessionmaker, relationship
 
 # --- LINE SDK (v3) ---
@@ -659,6 +659,31 @@ def admin_simulate_month(
         "events_per_target": times
     }
 
+# “実績の絶対値”を確認できるデバッグAPI
+@app.get("/admin/monthly_totals_debug")
+def admin_monthly_totals_debug(key: str = Query(...), ym: str = Query(...), user_id: str | None = Query(None), db: Session = Depends(get_db)):
+    if key != ADMIN_KEY:
+        raise HTTPException(status_code=403, detail="forbidden")
+    start, end = month_range(ym)
+    base = select(
+        func.count().label("events"),
+        func.sum(case((CheckinEvent.result=="did",   1), else_=0)).label("did"),
+        func.sum(case((CheckinEvent.result=="didnt", 1), else_=0)).label("didnt"),
+        func.sum(case((CheckinEvent.result=="pass",  1), else_=0)).label("pass"),
+    ).where(CheckinEvent.date>=start, CheckinEvent.date<=end)
+    if user_id:
+        base = base.where(CheckinEvent.user_id == user_id)
+    row = db.execute(base).one()
+    return {
+        "ym": ym,
+        "user_id": user_id,
+        "events": int(row.events or 0),
+        "did": int(row.did or 0),
+        "didnt": int(row.didnt or 0),
+        "pass": int(row.pass or 0),
+    }
+
+
 # --- postback解析 ---
 def parse_postback(data: str) -> dict:
     try:
@@ -781,14 +806,28 @@ def _chunks(seq: List, n: int):
 # --- 月次サマリ(JSON & push) ---
 def summarize_user_month(db: Session, user_id: str, ym: str):
     start, end = month_range(ym)
-    q = (select(CheckinEvent.behavior_id, Behavior.title, Behavior.kind,
-                func.sum(case((CheckinEvent.result=="did", 1), else_=0)).label("did"),
-                func.sum(case((CheckinEvent.result=="didnt", 1), else_=0)).label("didnt"),
-                func.sum(case((CheckinEvent.result=="pass", 1), else_=0)).label("pass_cnt"),
-                func.count().label("events"))
-         .join(Behavior, Behavior.id==CheckinEvent.behavior_id)
-         .where(CheckinEvent.user_id==user_id, CheckinEvent.date>=start, CheckinEvent.date<=end)
-         .group_by(CheckinEvent.behavior_id, Behavior.title))
+    # Behavior が削除/未Seedでもイベントは集計する（タイトル等はダミーに）
+    title_co = func.coalesce(Behavior.title, literal("（削除済みの行動）"))
+    kind_co  = func.coalesce(Behavior.kind,  literal("action"))
+    q = (
+        select(
+            CheckinEvent.behavior_id,
+            title_co.label("title"),
+            kind_co.label("kind"),
+            func.sum(case((CheckinEvent.result == "did",   1), else_=0)).label("did"),
+            func.sum(case((CheckinEvent.result == "didnt", 1), else_=0)).label("didnt"),
+            func.sum(case((CheckinEvent.result == "pass",  1), else_=0)).label("pass_cnt"),
+            func.count().label("events"),
+        )
+        .select_from(CheckinEvent)
+        .join(Behavior, Behavior.id == CheckinEvent.behavior_id, isouter=True)  # ← LEFT OUTER JOIN
+        .where(
+            CheckinEvent.user_id == user_id,
+            CheckinEvent.date >= start,
+            CheckinEvent.date <= end,
+        )
+        .group_by(CheckinEvent.behavior_id, title_co, kind_co)
+    )
     rows = db.execute(q).all()
     items = []
     for r in rows:
@@ -821,7 +860,8 @@ def admin_monthly_summary(key: str = Query(...), ym: str = Query(...), user_id: 
 def build_monthly_text(ym: str, items: List[dict]) -> str:
     if not items:
         return f"📅 {ym} の記録はありません。"
-    # 全体集計
+    # 全体集計（JOINの影響を避けるためイベントテーブル総和で）
+    # ※ ここでDBを再参照できないので、items合計でもOKならそのままで構いません。
     total_events = sum(it["total"] for it in items)
     total_did = sum(it["did"] for it in items)
     overall_rate = round((total_did/total_events)*100, 1) if total_events else 0.0
