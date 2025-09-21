@@ -669,7 +669,7 @@ def admin_monthly_totals_debug(key: str = Query(...), ym: str = Query(...), user
         func.count().label("events"),
         func.sum(case((CheckinEvent.result=="did",   1), else_=0)).label("did"),
         func.sum(case((CheckinEvent.result=="didnt", 1), else_=0)).label("didnt"),
-        func.sum(case((CheckinEvent.result=="pass",  1), else_=0)).label("pass"),
+        func.sum(case((CheckinEvent.result=="pass",  1), else_=0)).label("pass_cnt"),
     ).where(CheckinEvent.date>=start, CheckinEvent.date<=end)
     if user_id:
         base = base.where(CheckinEvent.user_id == user_id)
@@ -680,7 +680,7 @@ def admin_monthly_totals_debug(key: str = Query(...), ym: str = Query(...), user
         "events": int(row.events or 0),
         "did": int(row.did or 0),
         "didnt": int(row.didnt or 0),
-        "pass": int(row.pass or 0),
+        "pass": int(row.pass_cnt or 0),
     }
 
 
