@@ -14,7 +14,7 @@ from pydantic import BaseModel
 from dotenv import load_dotenv
 
 from sqlalchemy import (create_engine, String, DateTime, Date, Integer, ForeignKey,
-                        UniqueConstraint, select, func, case, literal)
+                        UniqueConstraint, select, func, case, literal, CheckConstraint)
 from sqlalchemy.orm import declarative_base, Mapped, mapped_column, Session, sessionmaker, relationship
 
 # --- LINE SDK (v3) ---
@@ -69,6 +69,16 @@ class CheckinEvent(Base):
     created_at: Mapped[datetime] = mapped_column(DateTime, default=lambda: datetime.now(JST))
     __table_args__ = (CheckConstraint("result in ('did','didnt','pass')", name="ck_event_result"),)
 
+# 通知ログ（分母）：1通知=1レコード。基本は 1日1通知/行動/ユーザ
+class CheckinPrompt(Base):
+    __tablename__ = "checkin_prompts"
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    user_id: Mapped[str] = mapped_column(String, index=True)
+    behavior_id: Mapped[str] = mapped_column(String, ForeignKey("behaviors.id"), index=True)
+    date: Mapped[date] = mapped_column(Date, index=True)   # 通知日のJST日付
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=lambda: datetime.now(JST))
+    # 同じ日に同じ行動へ複数回は基本送らない想定
+    __table_args__ = (UniqueConstraint("user_id", "behavior_id", "date", name="uq_prompt_udb"),)
 
 class User(Base):
     __tablename__ = "users"
@@ -430,6 +440,12 @@ def cron_daily(token: str = Query(...), db: Session = Depends(get_db)):
             except Exception:
                 # 個別失敗はスキップ（無効ユーザなど）
                 pass
+        # 分母：ユーザー毎の全有効行動に対して「その日付の通知ログ」を残す
+        today = datetime.now(JST).date()
+        ubs = db.execute(select(UserBehavior).where(UserBehavior.enabled==True, UserBehavior.user_id.in_(users))).scalars().all()
+        for ub in ubs:
+            ensure_prompt(db, ub.user_id, ub.behavior_id, today)
+        db.commit()
     return {"pushed": pushed}
 
 def _should_send(u: UserBehavior, now: datetime) -> bool:
@@ -486,6 +502,11 @@ def cron_dispatch_test(token: str = Query(...), when: str | None = Query(None), 
                 except Exception as e:
                     errors += 1
                     logger.exception(f"push failed: {e}")
+            # 分母：このユーザーに対して通知した全行動ID分、当日付で1件ずつログ
+            dday = now.date()
+            for hid in hids:
+                ensure_prompt(db, uid, hid, dday)
+    db.commit()
     return {"now": now.isoformat(), "candidates": len(ubs), "pushed": pushed, "errors": errors, "mode": mode}
 
 # --- 管理用：当日達成率の簡易API ---
@@ -634,6 +655,63 @@ def admin_simulate_day(
     db.commit()
     return {"date": day.isoformat(), "targets": len(ubs), "events_per_target": times, "did": did, "didnt": didnt, "pass": passed}
 
+@app.post("/admin/simulate_days_seq")
+def admin_simulate_days_seq(
+    key: str = Query(...),
+    start: str = Query(..., description="開始日 YYYY-MM-DD（この日から days 日連続で通知を作成）"),
+    days: int = Query(..., ge=1, le=366),
+    user_id: str | None = Query(None, description="対象ユーザーを絞る場合"),
+    fixed: str | None = Query(None, description="did|didnt|pass 全応答固定（応答がある場合）"),
+    respond_rate: float = Query(1.0, ge=0.0, le=1.0, description="通知に対して応答する確率（分子発生確率）"),
+    did_rate: float = Query(0.75, ge=0.0, le=1.0, description="応答があるとき 'did' になる確率"),
+    pass_rate: float = Query(0.1, ge=0.0, le=1.0, description="応答があるとき 'pass' になる確率（残りは 'didnt'）"),
+    db: Session = Depends(get_db),
+):
+    """days 回＝ days 日分のユニーク日付で通知（分母）を作成。応答は respond_rate に従い生成。"""
+    if key != ADMIN_KEY:
+        raise HTTPException(status_code=403, detail="forbidden")
+    start_date = date.fromisoformat(start)
+    q = select(UserBehavior).where(UserBehavior.enabled==True)
+    if user_id:
+        q = q.where(UserBehavior.user_id == user_id)
+    ubs = db.execute(q).scalars().all()
+    if not ubs:
+        return {"inserted_prompts": 0, "inserted_events": 0, "targets": 0, "days": days}
+
+    def pick_result() -> str:
+        if fixed in ("did", "didnt", "pass"):
+            return fixed
+        r = random.random()
+        if r < did_rate: return "did"
+        if r < did_rate + pass_rate: return "pass"
+        return "didnt"
+
+    prompts = events = did = didnt = passed = 0
+    for i in range(days):
+        dday = start_date + timedelta(days=i)
+        for ub in ubs:
+            ensure_prompt(db, ub.user_id, ub.behavior_id, dday)
+            prompts += 1
+            # 応答する場合のみイベント化（分子）※分母は増やさない
+            if random.random() < respond_rate:
+                res = pick_result()
+                db.add(CheckinEvent(user_id=ub.user_id, behavior_id=ub.behavior_id, date=dday, result=res))
+                events += 1
+                if res == "did": did += 1
+                elif res == "didnt": didnt += 1
+                else: passed += 1
+            # Checkin（日次一意）は“最後の応答”で更新（応答がない日は触らない）
+    db.commit()
+    return {
+        "targets": len(ubs),
+        "days": days,
+        "inserted_prompts": prompts,
+        "inserted_events": events,
+        "did": did, "didnt": didnt, "pass": passed,
+        "start": start_date.isoformat(),
+        "end": (start_date + timedelta(days=days-1)).isoformat()
+    }
+
 @app.post("/admin/simulate_month")
 def admin_simulate_month(
     key: str = Query(...),
@@ -674,9 +752,15 @@ def admin_monthly_totals_debug(key: str = Query(...), ym: str = Query(...), user
     if user_id:
         base = base.where(CheckinEvent.user_id == user_id)
     row = db.execute(base).one()
+    # 分母：prompts 総数
+    p_base = select(func.count().label("prompts")).where(CheckinPrompt.date>=start, CheckinPrompt.date<=end)
+    if user_id:
+        p_base = p_base.where(CheckinPrompt.user_id==user_id)
+    prow = db.execute(p_base).one()
     return {
         "ym": ym,
         "user_id": user_id,
+        "prompts": int(prow.prompts or 0),
         "events": int(row.events or 0),
         "did": int(row.did or 0),
         "didnt": int(row.didnt or 0),
@@ -803,43 +887,74 @@ def _chunks(seq: List, n: int):
     for i in range(0, len(seq), n):
         yield seq[i:i+n]
 
+def ensure_prompt(db: Session, user_id: str, behavior_id: str, d: date):
+    """同一日付の通知ログが無ければ1行作成（分母）。"""
+    exists = db.execute(
+        select(CheckinPrompt.id).where(
+            CheckinPrompt.user_id == user_id,
+            CheckinPrompt.behavior_id == behavior_id,
+            CheckinPrompt.date == d
+        )
+    ).first()
+    if not exists:
+        db.add(CheckinPrompt(user_id=user_id, behavior_id=behavior_id, date=d))
+
 # --- 月次サマリ(JSON & push) ---
 def summarize_user_month(db: Session, user_id: str, ym: str):
     start, end = month_range(ym)
-    # Behavior が削除/未Seedでもイベントは集計する（タイトル等はダミーに）
+    # 分母（prompts）サブクエリ
+    p_sq = (
+        select(
+            CheckinPrompt.behavior_id.label("bid"),
+            func.count().label("prompts")
+        )
+        .where(CheckinPrompt.user_id==user_id, CheckinPrompt.date>=start, CheckinPrompt.date<=end)
+        .group_by(CheckinPrompt.behavior_id)
+        .subquery()
+    )
+    # 分子（events）サブクエリ
+    e_sq = (
+        select(
+            CheckinEvent.behavior_id.label("bid"),
+            func.sum(case((CheckinEvent.result=="did",   1), else_=0)).label("did"),
+            func.sum(case((CheckinEvent.result=="didnt", 1), else_=0)).label("didnt"),
+            func.sum(case((CheckinEvent.result=="pass",  1), else_=0)).label("pass_cnt"),
+            func.count().label("events")
+        )
+        .where(CheckinEvent.user_id==user_id, CheckinEvent.date>=start, CheckinEvent.date<=end)
+        .group_by(CheckinEvent.behavior_id)
+        .subquery()
+    )
+    # 分母を基準（通知があったものを主集合とする）。タイトル等は Behavior からLEFTで補完
     title_co = func.coalesce(Behavior.title, literal("（削除済みの行動）"))
     kind_co  = func.coalesce(Behavior.kind,  literal("action"))
     q = (
         select(
-            CheckinEvent.behavior_id,
+            p_sq.c.bid.label("behavior_id"),
             title_co.label("title"),
             kind_co.label("kind"),
-            func.sum(case((CheckinEvent.result == "did",   1), else_=0)).label("did"),
-            func.sum(case((CheckinEvent.result == "didnt", 1), else_=0)).label("didnt"),
-            func.sum(case((CheckinEvent.result == "pass",  1), else_=0)).label("pass_cnt"),
-            func.count().label("events"),
+            p_sq.c.prompts,
+            func.coalesce(e_sq.c.did, 0).label("did"),
+            func.coalesce(e_sq.c.didnt, 0).label("didnt"),
+            func.coalesce(e_sq.c.pass_cnt, 0).label("pass_cnt"),
+            func.coalesce(e_sq.c.events, 0).label("events")
         )
-        .select_from(CheckinEvent)
-        .join(Behavior, Behavior.id == CheckinEvent.behavior_id, isouter=True)  # ← LEFT OUTER JOIN
-        .where(
-            CheckinEvent.user_id == user_id,
-            CheckinEvent.date >= start,
-            CheckinEvent.date <= end,
-        )
-        .group_by(CheckinEvent.behavior_id, title_co, kind_co)
+        .select_from(p_sq)
+        .join(Behavior, Behavior.id==p_sq.c.bid, isouter=True)
+        .join(e_sq, e_sq.c.bid==p_sq.c.bid, isouter=True)
     )
     rows = db.execute(q).all()
     items = []
     for r in rows:
+        prompts = int(r.prompts or 0)
         done = int(r.did or 0); skipped = int(r.didnt or 0); pss = int(r.pass_cnt or 0)
-        total = int(r.events or 0)
-        rate = (done / total) if total else 0.0
+        rate = (done / prompts) if prompts else 0.0
         items.append({
             "behavior_id": r.behavior_id,
             "title": r.title,
             "kind": r.kind,
             "did": done, "didnt": skipped, "pass": pss,
-            "total": total,
+            "total": prompts,           # ← 分母は通知回数
             "rate": round(rate*100, 1),
             "grade": grade_by_rate(rate)
         })
@@ -860,17 +975,17 @@ def admin_monthly_summary(key: str = Query(...), ym: str = Query(...), user_id: 
 def build_monthly_text(ym: str, items: List[dict]) -> str:
     if not items:
         return f"📅 {ym} の記録はありません。"
-    # 全体集計（JOINの影響を避けるためイベントテーブル総和で）
-    # ※ ここでDBを再参照できないので、items合計でもOKならそのままで構いません。
-    total_events = sum(it["total"] for it in items)
+
+    # 分母＝prompts、分子＝did
+    total_prompts = sum(it["total"] for it in items)
     total_did = sum(it["did"] for it in items)
-    overall_rate = round((total_did/total_events)*100, 1) if total_events else 0.0
+    overall_rate = round((total_did/total_prompts)*100, 1) if total_prompts else 0.0
     # 上位5件（達成率→達成回数→タイトルで並べ替え済み）
     icons = {"action": "🏃", "mind": "🧠"}
     grade_icon = {"S":"🏆", "A":"🎖️", "B":"👍", "C":"📝"}
     lines = [
         f"📅 {ym} の月次サマリ",
-        f"合計応答：{total_events} 回　達成：{total_did} 回（{overall_rate}%）",
+        f"配信：{total_prompts} 回　達成：{total_did} 回（{overall_rate}%）",
         "— 上位トピック —",
     ]
     for i, it in enumerate(items[:5], start=1):
