@@ -21,7 +21,7 @@ on:
       times:
         description: "How many bursts / events per target"
         required: true
-        default: "10"
+        default: "5"
 
 jobs:
   run:
