@@ -326,27 +326,39 @@ def on_postback(event: PostbackEvent):
                 )
             return
         d = today_jst()
+        label_map = {"did": "できた", "didnt": "できない", "pass": "パス"}
         with SessionLocal() as db:
             if not db.get(User, user_id):
                 db.add(User(user_id=user_id)); db.commit()
+            beh = db.get(Behavior, hid)
+            title = beh.title if beh else "（行動）"
             row = db.execute(select(Checkin).where(
                 Checkin.user_id==user_id, Checkin.behavior_id==hid, Checkin.date==d
             )).scalar_one_or_none()
             if row:
                 if row.result == res:
-                    msg = "本日分は同じ結果で記録済みです。（追記も行いました）"
+                    msg_core = "本日分は同じ結果で記録済みです（追記しました）。"
                 else:
                     row.result = res
-                    msg = "本日分を更新しました。（追記も行いました）"
+                    msg_core = "本日分の結果を更新し、追記しました。"
             else:
                 db.add(Checkin(user_id=user_id, behavior_id=hid, date=d, result=res))
-                msg = "本日分を記録しました。（追記も行いました）"
-            # 追加：タップの“イベント”を1行追記
+                msg_core = "本日分を記録し、追記しました。"
+            # 追記イベントを1行保存
             db.add(CheckinEvent(user_id=user_id, behavior_id=hid, date=d, result=res))
             db.commit()
+            # 今日その行動に対する累計回数を出す
+            cnt_today = db.execute(
+                select(func.count(CheckinEvent.id)).where(
+                    CheckinEvent.user_id==user_id,
+                    CheckinEvent.behavior_id==hid,
+                    CheckinEvent.date==d,
+                )
+            ).scalar_one()
+        reply_text = f"『{title}』に「{label_map[res]}」で応答しました。\n{msg_core}\n（本日 {cnt_today} 回目）"
         with ApiClient(configuration) as api_client:
             MessagingApi(api_client).reply_message(
-                ReplyMessageRequest(replyToken=event.reply_token, messages=[TextMessage(text=msg)])
+                ReplyMessageRequest(replyToken=event.reply_token, messages=[TextMessage(text=reply_text)])
             )
         return
 
@@ -769,7 +781,7 @@ def _chunks(seq: List, n: int):
 # --- 月次サマリ(JSON & push) ---
 def summarize_user_month(db: Session, user_id: str, ym: str):
     start, end = month_range(ym)
-    q = (select(CheckinEvent.behavior_id, Behavior.title,
+    q = (select(CheckinEvent.behavior_id, Behavior.title, Behavior.kind,
                 func.sum(case((CheckinEvent.result=="did", 1), else_=0)).label("did"),
                 func.sum(case((CheckinEvent.result=="didnt", 1), else_=0)).label("didnt"),
                 func.sum(case((CheckinEvent.result=="pass", 1), else_=0)).label("pass_cnt"),
@@ -786,6 +798,7 @@ def summarize_user_month(db: Session, user_id: str, ym: str):
         items.append({
             "behavior_id": r.behavior_id,
             "title": r.title,
+            "kind": r.kind,
             "did": done, "didnt": skipped, "pass": pss,
             "total": total,
             "rate": round(rate*100, 1),
@@ -806,13 +819,28 @@ def admin_monthly_summary(key: str = Query(...), ym: str = Query(...), user_id: 
     return {"ym": ym, "users": {uid: summarize_user_month(db, uid, ym) for uid in users}}
 
 def build_monthly_text(ym: str, items: List[dict]) -> str:
-    s = [f"{ym} のサマリ（応答回数ベース）"]
-    for it in items[:5]:  # 上位5件だけ
-        s.append(
-            f"☑ {it['title']}\n"
-            f"  実行回数 {it['did']}/{it['total']}  達成率 {it['rate']}%  評価 {it['grade']}"
+    if not items:
+        return f"📅 {ym} の記録はありません。"
+    # 全体集計
+    total_events = sum(it["total"] for it in items)
+    total_did = sum(it["did"] for it in items)
+    overall_rate = round((total_did/total_events)*100, 1) if total_events else 0.0
+    # 上位5件（達成率→達成回数→タイトルで並べ替え済み）
+    icons = {"action": "🏃", "mind": "🧠"}
+    grade_icon = {"S":"🏆", "A":"🎖️", "B":"👍", "C":"📝"}
+    lines = [
+        f"📅 {ym} の月次サマリ",
+        f"合計応答：{total_events} 回　達成：{total_did} 回（{overall_rate}%）",
+        "— 上位トピック —",
+    ]
+    for i, it in enumerate(items[:5], start=1):
+        icon = icons.get(it.get("kind"), "•")
+        gi = grade_icon.get(it["grade"], "•")
+        lines.append(
+            f"{i}. {icon}{it['title']} {gi}\n"
+            f"   達成 {it['did']}/{it['total']}（{it['rate']}%）・できない {it['didnt']}・パス {it['pass']}"
         )
-    return "\n".join(s) if len(items) else f"{ym} の記録がありません。"
+    return "\n".join(lines)
 
 @app.post("/admin/push_monthly")
 def admin_push_monthly(key: str = Query(...), ym: str = Query(...), db: Session = Depends(get_db)):
